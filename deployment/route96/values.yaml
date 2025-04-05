@@ -1,26 +1,19 @@
 replicaCount: 3
-
 image:
   repository: nginx
-  tag: NA
+  tag: 0.0.1-PullRequest1.164
   pullPolicy: IfNotPresent
-
 pdb:
   minAvailable: 1
-
 autoscaling:
   minReplicas: 1
   maxReplicas: 1
   targetCPUUtilizationPercentage: 80
-
 persistence:
   size: "1Gi"
-
-
 service:
   type: ClusterIP
   port: 80
-
 ingress:
   enabled: true
   className: "nginx"
