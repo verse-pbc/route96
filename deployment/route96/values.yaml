@@ -1,8 +1,8 @@
-replicaCount: 3
+replicaCount: 1
 image:
-  repository: nginx
+  repository: ghcr.io/verse-pbc/route96
   tag: ""
-  pullPolicy: IfNotPresent
+  pullPolicy: Always
 pdb:
   minAvailable: 1
 autoscaling:
@@ -10,11 +10,11 @@ autoscaling:
   maxReplicas: 1
   targetCPUUtilizationPercentage: 80
 persistence:
-  size: "1Gi"
+  size: "10Gi"
 service:
   type: ClusterIP
   port: 80
 ingress:
-  enabled: true
+  enabled: false
   className: "nginx"
   host: "blossom.plur.app"
