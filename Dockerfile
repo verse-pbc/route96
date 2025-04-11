@@ -46,7 +46,7 @@ RUN yarn && yarn build
 FROM debian:bookworm-slim AS runner
 WORKDIR /app
 RUN apt update && \
-    apt install -y libx264-164 libwebp7 libwebpmux7 libvpx7 ca-certificates && \
+    apt install -y libx264-164 libwebp7 libvpx7 ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -r appgroup && useradd --no-log-init -r -g appgroup appuser
