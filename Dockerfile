@@ -60,6 +60,7 @@ COPY --from=build /app/ffmpeg/lib/libavformat.so.* /lib/
 COPY --from=build /app/ffmpeg/lib/libavutil.so.* /lib/
 COPY --from=build /app/ffmpeg/lib/libswresample.so.* /lib/
 COPY --from=build /app/ffmpeg/lib/libswscale.so.* /lib/
+COPY --from=build /usr/lib/x86_64-linux-gnu/libwebpmux.so.* /usr/lib/x86_64-linux-gnu/
 
 # Update the linker cache
 RUN ldconfig
@@ -71,17 +72,5 @@ RUN ls -l /app && ls -l /app/bin
 
 USER appuser
 
-# === DIAGNOSTICS START ===
-RUN echo "--- Diagnostics --- Running as: $(whoami)"
-RUN echo "--- Finding libwebp/mux files ---"
-# Check for both libwebp and libwebpmux in system and /lib locations
-RUN ls -l /usr/lib/*-linux-gnu/libwebp* /usr/lib/*-linux-gnu/libwebpmux* /lib/libwebp* /lib/libwebpmux* || echo "Webp/mux libs not found in expected locations"
-RUN echo "--- Checking ldconfig cache for webp/mux ---"
-# Grep cache for both webp and webpmux
-RUN ldconfig -p | grep -E 'webp|webpmux' || echo "Webp/mux libs not found in ldconfig cache"
-RUN echo "--- Checking dependencies for route96 ---"
-RUN ldd /app/bin/route96 || echo "ldd command failed"
-RUN echo "--- Diagnostics END ---"
-
-RUN LD_LIBRARY_PATH=/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH ./bin/route96 --version
-ENTRYPOINT ["/bin/sh", "-c", "LD_LIBRARY_PATH=/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH /app/bin/route96 $*"]
+RUN ./bin/route96 --version
+ENTRYPOINT ["/app/bin/route96"]
