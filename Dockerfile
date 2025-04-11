@@ -65,5 +65,15 @@ RUN ls -l /app && ls -l /app/bin
 
 USER appuser
 
+# === DIAGNOSTICS START ===
+RUN echo "--- Diagnostics --- Running as: $(whoami)"
+RUN echo "--- Finding libwebp files ---"
+RUN ls -l /usr/lib/*-linux-gnu/libwebp* /lib/libwebp* || echo "Webp libs not found in expected locations"
+RUN echo "--- Checking ldconfig cache for webp ---"
+RUN ldconfig -p | grep webp || echo "Webp libs not found in ldconfig cache"
+RUN echo "--- Checking dependencies for route96 ---"
+RUN ldd /app/bin/route96 || echo "ldd command failed"
+RUN echo "--- Diagnostics END ---"
+
 RUN ./bin/route96 --version
 ENTRYPOINT ["/app/bin/route96"]
