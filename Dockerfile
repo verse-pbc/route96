@@ -46,7 +46,7 @@ RUN yarn && yarn build
 FROM debian:bookworm-slim AS runner
 WORKDIR /app
 RUN apt update && \
-    apt install -y libx264-164 libwebp7 libvpx7 ca-certificates && \
+    apt install -y libx264-164 libwebp7 libvpx7 ca-certificates libxcb1 libxcb-shm0 && \
     rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -r appgroup && useradd --no-log-init -r -g appgroup appuser
@@ -75,5 +75,5 @@ RUN echo "--- Checking dependencies for route96 ---"
 RUN ldd /app/bin/route96 || echo "ldd command failed"
 RUN echo "--- Diagnostics END ---"
 
-RUN ./bin/route96 --version
-ENTRYPOINT ["/app/bin/route96"]
+RUN LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH ./bin/route96 --version
+ENTRYPOINT ["/bin/sh", "-c", "LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH /app/bin/route96 $*"]
