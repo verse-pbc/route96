@@ -53,7 +53,13 @@ RUN groupadd -r appgroup && useradd --no-log-init -r -g appgroup appuser
 
 COPY --from=build /app/build .
 COPY --from=ui_builder /app/src/dist ui
-COPY --from=build /app/ffmpeg/lib/ /lib
+COPY --from=build /app/ffmpeg/lib/libavcodec.so.* /lib/
+COPY --from=build /app/ffmpeg/lib/libavdevice.so.* /lib/
+COPY --from=build /app/ffmpeg/lib/libavfilter.so.* /lib/
+COPY --from=build /app/ffmpeg/lib/libavformat.so.* /lib/
+COPY --from=build /app/ffmpeg/lib/libavutil.so.* /lib/
+COPY --from=build /app/ffmpeg/lib/libswresample.so.* /lib/
+COPY --from=build /app/ffmpeg/lib/libswscale.so.* /lib/
 
 # Update the linker cache
 RUN ldconfig
@@ -75,5 +81,5 @@ RUN echo "--- Checking dependencies for route96 ---"
 RUN ldd /app/bin/route96 || echo "ldd command failed"
 RUN echo "--- Diagnostics END ---"
 
-RUN LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH ./bin/route96 --version
-ENTRYPOINT ["/bin/sh", "-c", "LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH /app/bin/route96 $*"]
+RUN LD_LIBRARY_PATH=/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH ./bin/route96 --version
+ENTRYPOINT ["/bin/sh", "-c", "LD_LIBRARY_PATH=/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH /app/bin/route96 $*"]
