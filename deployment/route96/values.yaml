@@ -23,4 +23,4 @@ service:
 ingress:
   enabled: true
   className: "nginx"
-  host: "blossom.plur.app"
+  host: "blossom.verse.app"
