@@ -9,9 +9,9 @@ metadata:
     app.kubernetes.io/managed-by: Helm
 spec:
   tls:
-  - hosts:
-    - {{ .Values.ingress.host }}
-    secretName: blossom-certificate
+    - hosts:
+      - {{ .Values.ingress.host }}
+      secretName: blossom-certificate
   rules:
     - host: {{ .Values.ingress.host }}
       http:
