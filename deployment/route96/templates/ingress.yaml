@@ -4,12 +4,14 @@ kind: Ingress
 metadata:
   name: blossom-ingress
   namespace: blossom
-  annotations:
-    kubernetes.io/ingress.class: {{ .Values.ingress.className }}
   labels:
     app.kubernetes.io/part-of: blossom
     app.kubernetes.io/managed-by: Helm
 spec:
+  tls:
+    - hosts:
+      - {{ .Values.ingress.host }}
+      secretName: blossom-certificate
   rules:
     - host: {{ .Values.ingress.host }}
       http:
@@ -21,4 +23,5 @@ spec:
                 name: blossom-service
                 port:
                   number: 80
+  ingressClassName: {{ .Values.ingress.className }}
 {{- end -}}
