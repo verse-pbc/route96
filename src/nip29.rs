@@ -1,13 +1,13 @@
 use crate::settings::Settings;
 use anyhow::anyhow;
 use log::{debug, error, info, warn};
+use nostr_relay_pool::prelude::*;
 use nostr_sdk::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::{self, JoinHandle};
-use tokio::time::timeout;
 
 /// Constant for the Nostr event kind used for group membership (NIP-29).
 const GROUP_MEMBERSHIP_KIND: Kind = Kind::Custom(39002);
@@ -191,35 +191,27 @@ pub async fn init_nip29_client(
         .author(relay_pubkey)
         .kinds(vec![GROUP_ADMINS_KIND, GROUP_MEMBERSHIP_KIND]);
 
-    info!("Fetching initial NIP-29 events...");
-    // Fetch events using fetch_events_from
-    match timeout(
-        FETCH_TIMEOUT + Duration::from_secs(2), // Outer timeout guard
-        client.fetch_events_from(
-            vec![relay_url.clone()],
-            initial_filter.clone(),
-            FETCH_TIMEOUT,
-        ),
+    info!("Fetching initial NIP-29 events via pagination...");
+    const INITIAL_PAGE_SIZE: u64 = 200;
+    match fetch_paginated_events_from(
+        &client,
+        initial_filter.clone(),
+        INITIAL_PAGE_SIZE,
+        FETCH_TIMEOUT,
     )
     .await
     {
-        Ok(Ok(events)) => {
+        Ok(events) => {
             info!("Fetched {} initial NIP-29 events", events.len());
             let mut cache_writer = cache.write().await;
             for event in events {
                 update_cache_entry(&event, &mut cache_writer, &relay_pubkey).await;
             }
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             warn!(
-                "Error fetching initial NIP-29 events from {}: {}. Cache might be stale.",
+                "Error during paginated fetch of initial NIP-29 events from {}: {}. Cache might be incomplete.",
                 relay_url, e
-            );
-        }
-        Err(_) => {
-            warn!(
-                "Timeout fetching initial NIP-29 events from {} after {:?}. Cache might be stale.",
-                relay_url, FETCH_TIMEOUT
             );
         }
     }
@@ -300,4 +292,116 @@ pub async fn init_nip29_client(
 
     info!("NIP-29 client initialized successfully.");
     Ok((Arc::new(nip29_client_instance), join_handle))
+}
+
+/// Fetches events from the client's connected relays, handling pagination automatically.
+///
+/// This function repeatedly queries the client's relays for events matching
+/// the `initial_filter`, fetching them in batches (`page_size`). It continues
+/// fetching older batches until no more events are returned, effectively
+/// retrieving all historical events matching the filter from those relays.
+///
+/// # Arguments
+/// * `client` - The nostr_sdk Client instance.
+/// * `initial_filter` - The base filter specifying the desired events (kinds, authors, tags, etc.).
+///                      Do **not** set `limit` or `until` on this filter; the function manages them.
+/// * `page_size` - The number of events to request per batch (relay `limit`).
+/// * `timeout_per_page` - The timeout duration to wait for each individual page request.
+///
+/// # Returns
+/// * `Result<Events, Error>` - On success, returns a `Events` struct containing all
+///                             fetched, sorted, and deduplicated events. On failure, returns
+///                             a `nostr_sdk::client::Error`.
+pub async fn fetch_paginated_events_from(
+    client: &Client,
+    initial_filter: Filter,
+    page_size: u64,
+    timeout_per_page: Duration,
+) -> Result<Events, Error> {
+    debug!(
+        "Starting paginated fetch with filter: {:?}, page_size: {}, timeout: {:?}",
+        initial_filter, page_size, timeout_per_page
+    );
+
+    let mut combined_events = Events::new(&initial_filter);
+    let mut current_until: Option<Timestamp> = None;
+    let mut last_oldest_event_id: Option<EventId> = None;
+
+    loop {
+        // Prepare the filter for the current page request
+        let mut page_filter = initial_filter.clone();
+        page_filter = page_filter.limit(page_size as usize);
+        if let Some(until_ts) = current_until {
+            page_filter = page_filter.until(until_ts);
+        }
+
+        debug!("Fetching page with filter: {:?}", page_filter);
+
+        let page_result: Result<Events, Error> = client
+            .fetch_events(page_filter.clone(), timeout_per_page)
+            .await;
+
+        match page_result {
+            Ok(fetched_page_events) => {
+                if fetched_page_events.is_empty() {
+                    debug!("Fetched empty page, stopping pagination.");
+                    break; // No more events found for this filter range
+                }
+
+                debug!(
+                    "Fetched {} events for this page.",
+                    fetched_page_events.len()
+                );
+
+                let oldest_event_in_page = fetched_page_events.iter().last();
+
+                if let Some(oldest_event) = oldest_event_in_page {
+                    let oldest_ts = oldest_event.created_at;
+                    let oldest_id = oldest_event.id;
+                    debug!(
+                        "Oldest event in this page: id={}, timestamp={}",
+                        oldest_id.to_hex(),
+                        oldest_ts
+                    );
+
+                    // Merge events *before* calculating next 'until'
+                    combined_events = combined_events.merge(fetched_page_events);
+
+                    // Determine the 'until' timestamp for the *next* iteration.
+                    let next_until_ts = if last_oldest_event_id == Some(oldest_id) {
+                        // We fetched the same oldest event as the last page,
+                        // indicating timestamp collision or relay behavior requiring
+                        // decrementing the timestamp to force progress.
+                        debug!("Oldest event ID matches previous page, decrementing timestamp.");
+                        Timestamp::from(oldest_ts.as_u64().saturating_sub(1))
+                    } else {
+                        // Use the exact timestamp of the oldest event.
+                        oldest_ts
+                    };
+
+                    // Update the oldest ID for the next iteration's check.
+                    last_oldest_event_id = Some(oldest_id);
+
+                    // Set the timestamp for the next request.
+                    current_until = Some(next_until_ts);
+                } else {
+                    // This case should ideally not be reached if fetched_page_events wasn't empty,
+                    debug!(
+                        "Fetched non-empty Events, but couldn't find oldest event via iterator. Stopping."
+                    );
+                    break;
+                }
+            }
+            Err(e) => {
+                error!("Error fetching page: {}", e);
+                return Err(e);
+            }
+        }
+    }
+
+    debug!(
+        "Pagination finished. Total events fetched (after deduplication): {}",
+        combined_events.len()
+    );
+    Ok(combined_events)
 }
