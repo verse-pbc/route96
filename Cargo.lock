@@ -4576,6 +4576,7 @@ dependencies = [
  "libc",
  "log",
  "mime2ext",
+ "nostr-relay-pool",
  "nostr-sdk",
  "pretty_env_logger",
  "reqwest",
