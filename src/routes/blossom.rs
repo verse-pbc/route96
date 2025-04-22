@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::{self, File};
 use tokio::io::AsyncRead as TokioAsyncRead;
@@ -458,7 +458,15 @@ async fn mirror(
             .is_group_member(tag_val, &auth.event.pubkey)
             .await
         {
-            return BlossomResponse::forbidden("Not a member of the group specified in 'h' tag");
+            log::debug!(
+                "User {} is not a member of group {}. Mirror forbidden.",
+                auth.event.pubkey.to_hex(),
+                tag_val
+            );
+            return BlossomResponse::forbidden(&format!(
+                "Not a member of the group specified in 'h' tag: {}",
+                tag_val
+            ));
         }
         log::debug!("Group membership check passed for h_tag: {}", tag_val);
     }
@@ -740,22 +748,6 @@ async fn stream_to_temp_file_and_hash<'d>(
     Ok((TempFileCleanup(temp_path), hash, total_bytes))
 }
 
-async fn hash_file(file_path: &Path) -> anyhow::Result<Vec<u8>> {
-    let mut file = File::open(file_path).await?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0; 8192];
-
-    loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-
-    Ok(hasher.finalize().to_vec())
-}
-
 async fn process_upload(
     method: &str,
     auth: BlossomAuth,
@@ -814,7 +806,15 @@ async fn process_upload(
             .is_group_member(tag_val, &auth.event.pubkey)
             .await
         {
-            return BlossomResponse::forbidden("Not a member of the group specified in 'h' tag");
+            log::debug!(
+                "User {} is not a member of group {}. Upload forbidden.",
+                auth.event.pubkey.to_hex(),
+                tag_val
+            );
+            return BlossomResponse::forbidden(&format!(
+                "Not a member of the group specified in 'h' tag: {}",
+                tag_val
+            ));
         }
         log::debug!("Group membership check passed for h_tag: {}", tag_val);
     }
@@ -1025,9 +1025,15 @@ async fn admin_delete(
                     ));
                 }
                 if !nip29.is_group_member(file_h_tag, &auth.event.pubkey).await {
-                    return Ok(BlossomResponse::forbidden(
-                        "Admin not a member of the group (required for group file deletion)",
-                    ));
+                    log::debug!(
+                        "Admin user {} is not a member of group {}. Admin deletion forbidden.",
+                        auth.event.pubkey.to_hex(),
+                        file_h_tag
+                    );
+                    return Ok(BlossomResponse::forbidden(&format!(
+                        "Admin not a member of the group '{}' (required for group file deletion)",
+                        file_h_tag
+                    )));
                 }
             }
         }
