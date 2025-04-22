@@ -69,7 +69,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --verbose --no-default-features --features sqlx-postgres
 
   push_to_registry:
     needs: [get_version, test]
