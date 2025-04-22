@@ -34,11 +34,13 @@ struct Args {
 
 #[rocket::main]
 async fn main() -> Result<(), Error> {
-    // Set up logging with filter to reduce health endpoint verbosity
-    std::env::set_var(
-        "RUST_LOG",
-        "rocket::launch=info,rocket::server::health=off,rocket::server=info,rocket=info",
-    );
+    // Initialize logging - respect RUST_LOG if set, otherwise apply defaults.
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var(
+            "RUST_LOG",
+            "route96=debug,rocket::launch=info,rocket::server::health=off,rocket::server=info,rocket=info",
+        );
+    }
     pretty_env_logger::init();
 
     let args: Args = Args::parse();
