@@ -132,22 +132,42 @@ async fn update_cache_entry(event: &Event, cache: &mut GroupStateCache, relay_pu
         match event.kind {
             kind if kind == GROUP_ADMINS_KIND => {
                 // Replace the admin list for this group
-                let mut current_admins_to_remove = Vec::new();
-                // Find existing admins not in the new event
-                for (pk_hex, role) in group.iter() {
-                    if *role == GroupRole::Admin && !event_members_hex.contains(pk_hex) {
-                        current_admins_to_remove.push(pk_hex.clone());
-                    }
+                let current_group_keys: HashSet<String> = group.keys().cloned().collect();
+                let admin_keys_in_event: &HashSet<String> = &event_members_hex; // Alias for clarity
+
+                // Find users to downgrade (admins in cache, absent in event)
+                let keys_to_downgrade: Vec<String> = current_group_keys
+                    .iter()
+                    .filter(|pk_hex| {
+                        group.get(*pk_hex) == Some(&GroupRole::Admin)
+                            && !admin_keys_in_event.contains(*pk_hex)
+                    })
+                    .cloned()
+                    .collect();
+
+                // Downgrade old admins to Member
+                for pk_hex in keys_to_downgrade {
+                    debug!(
+                        "Downgrading admin {} to Member in group {} (removed via Kind 39001 event {})",
+                        pk_hex,
+                        group_id,
+                        event.id.to_hex()
+                    );
+                    group.insert(pk_hex.clone(), GroupRole::Member);
                 }
-                // Remove old admins
-                for pk_hex in current_admins_to_remove {
-                    debug!("Removing admin {} from group {}", pk_hex, group_id);
-                    group.remove(&pk_hex);
-                }
+
                 // Add/update admins from the event
-                for pk_hex in event_members_hex {
-                    debug!("Setting {} as admin for group {}", pk_hex, group_id);
-                    group.insert(pk_hex, GroupRole::Admin); // Overwrites if exists (e.g., was Member)
+                for pk_hex in admin_keys_in_event {
+                    // Check if the role needs updating to avoid unnecessary debug logs
+                    if group.get(pk_hex) != Some(&GroupRole::Admin) {
+                        debug!(
+                            "Setting/Updating {} as Admin for group {} (from Kind 39001 event {})",
+                            pk_hex,
+                            group_id,
+                            event.id.to_hex()
+                        );
+                    }
+                    group.insert(pk_hex.clone(), GroupRole::Admin);
                 }
             }
             kind if kind == GROUP_MEMBERSHIP_KIND => {
@@ -523,4 +543,316 @@ pub async fn fetch_paginated_events_from(
         combined_events.len()
     );
     Ok(combined_events)
+}
+
+/// Helper to create a NIP-29 event
+fn create_nip29_event(
+    kind: Kind,
+    group_id: &str,
+    p_tags_pks: &[PublicKey],
+    relay_keys: &Keys,
+) -> Event {
+    let p_tags: Vec<Tag> = p_tags_pks.iter().map(|pk| Tag::public_key(*pk)).collect();
+    let d_tag = Tag::identifier(group_id.to_string());
+
+    let mut tags = p_tags;
+    tags.push(d_tag);
+
+    // Use the corrected nostr-sdk 0.40.0 API
+    EventBuilder::new(kind, "") // Content is typically empty for these kinds
+        .tags(tags)
+        .sign_with_keys(relay_keys)
+        .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*; // Import items from the parent module
+    use nostr_sdk::prelude::*;
+    use std::str::FromStr;
+
+    // Helper function to create a dummy relay key
+    fn relay_keys() -> Keys {
+        Keys::generate()
+    }
+
+    // Helper function to create a user public key from a hex string
+    fn user_pk(hex: &str) -> PublicKey {
+        PublicKey::from_hex(hex).unwrap()
+    }
+
+    // Helper to create a NIP-29 event
+    fn create_nip29_event(
+        kind: Kind,
+        group_id: &str,
+        p_tags_pks: &[PublicKey],
+        relay_keys: &Keys,
+    ) -> Event {
+        let p_tags: Vec<Tag> = p_tags_pks.iter().map(|pk| Tag::public_key(*pk)).collect();
+        let d_tag = Tag::identifier(group_id.to_string());
+
+        let mut tags = p_tags;
+        tags.push(d_tag);
+
+        // Use the corrected nostr-sdk 0.40.0 API
+        EventBuilder::new(kind, "") // Content is typically empty for these kinds
+            .tags(tags)
+            .sign_with_keys(relay_keys)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_initial_load_admins_and_members() {
+        let relay_keys = relay_keys();
+        let relay_pubkey = relay_keys.public_key();
+        let mut cache = GroupStateCache::new();
+        let group_id = "test_group";
+
+        let admin1 = user_pk("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let admin2 = user_pk("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let member1 = user_pk("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+
+        // Event 1: Define Admins
+        let admin_event =
+            create_nip29_event(GROUP_ADMINS_KIND, group_id, &[admin1, admin2], &relay_keys);
+        super::update_cache_entry(&admin_event, &mut cache, &relay_pubkey).await;
+
+        // Event 2: Define Members (including one admin)
+        let member_event = create_nip29_event(
+            GROUP_MEMBERSHIP_KIND,
+            group_id,
+            &[admin1, member1],
+            &relay_keys,
+        );
+        super::update_cache_entry(&member_event, &mut cache, &relay_pubkey).await;
+
+        // Assertions
+        assert_eq!(
+            cache.get_role(group_id, &admin1.to_hex()),
+            Some(GroupRole::Admin)
+        );
+        assert_eq!(
+            cache.get_role(group_id, &admin2.to_hex()), // Admin2 was defined but not in member list
+            None                                        // Correctly removed by member event
+        );
+        assert_eq!(
+            cache.get_role(group_id, &member1.to_hex()),
+            Some(GroupRole::Member)
+        );
+        assert_eq!(cache.cache.get(group_id).map(|g| g.len()), Some(2)); // Only admin1 and member1 should remain
+    }
+
+    #[tokio::test]
+    async fn test_member_event_does_not_overwrite_admin() {
+        let relay_keys = relay_keys();
+        let relay_pubkey = relay_keys.public_key();
+        let mut cache = GroupStateCache::new();
+        let group_id = "test_group";
+        let admin1 = user_pk("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        // Setup: Make admin1 an admin
+        let admin_event = create_nip29_event(GROUP_ADMINS_KIND, group_id, &[admin1], &relay_keys);
+        super::update_cache_entry(&admin_event, &mut cache, &relay_pubkey).await;
+        assert_eq!(
+            cache.get_role(group_id, &admin1.to_hex()),
+            Some(GroupRole::Admin)
+        );
+
+        // Action: Send a member event listing the admin
+        let member_event =
+            create_nip29_event(GROUP_MEMBERSHIP_KIND, group_id, &[admin1], &relay_keys);
+        super::update_cache_entry(&member_event, &mut cache, &relay_pubkey).await;
+
+        // Assertion: Role should still be Admin
+        assert_eq!(
+            cache.get_role(group_id, &admin1.to_hex()),
+            Some(GroupRole::Admin)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_admin() {
+        let relay_keys = relay_keys();
+        let relay_pubkey = relay_keys.public_key();
+        let mut cache = GroupStateCache::new();
+        let group_id = "test_group";
+        let admin1 = user_pk("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let admin2 = user_pk("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        // Setup: Add admin1 and admin2
+        let initial_admin_event =
+            create_nip29_event(GROUP_ADMINS_KIND, group_id, &[admin1, admin2], &relay_keys);
+        super::update_cache_entry(&initial_admin_event, &mut cache, &relay_pubkey).await;
+        // Setup: Add them to member list too
+        let initial_member_event = create_nip29_event(
+            GROUP_MEMBERSHIP_KIND,
+            group_id,
+            &[admin1, admin2],
+            &relay_keys,
+        );
+        super::update_cache_entry(&initial_member_event, &mut cache, &relay_pubkey).await;
+        assert_eq!(
+            cache.get_role(group_id, &admin1.to_hex()),
+            Some(GroupRole::Admin)
+        );
+        assert_eq!(
+            cache.get_role(group_id, &admin2.to_hex()),
+            Some(GroupRole::Admin)
+        );
+
+        // Action 1: Remove admin1 via admin event
+        let remove_admin1_event =
+            create_nip29_event(GROUP_ADMINS_KIND, group_id, &[admin2], &relay_keys);
+        super::update_cache_entry(&remove_admin1_event, &mut cache, &relay_pubkey).await;
+
+        // Assertion 1: admin1 should no longer be admin, admin2 still is
+        assert_eq!(
+            cache.get_role(group_id, &admin1.to_hex()),
+            Some(GroupRole::Member)
+        ); // Still Member from last 39002
+        assert_eq!(
+            cache.get_role(group_id, &admin2.to_hex()),
+            Some(GroupRole::Admin)
+        );
+
+        // Action 2: Send member event *without* admin1
+        let remove_admin1_member_event = create_nip29_event(
+            GROUP_MEMBERSHIP_KIND,
+            group_id,
+            &[admin2], // Only admin2 remains
+            &relay_keys,
+        );
+        super::update_cache_entry(&remove_admin1_member_event, &mut cache, &relay_pubkey).await;
+
+        // Assertion 2: admin1 should be completely gone
+        assert_eq!(cache.get_role(group_id, &admin1.to_hex()), None);
+        assert_eq!(
+            cache.get_role(group_id, &admin2.to_hex()),
+            Some(GroupRole::Admin)
+        );
+        assert_eq!(cache.cache.get(group_id).map(|g| g.len()), Some(1)); // Only admin2 remains
+    }
+
+    #[tokio::test]
+    async fn test_remove_member() {
+        let relay_keys = relay_keys();
+        let relay_pubkey = relay_keys.public_key();
+        let mut cache = GroupStateCache::new();
+        let group_id = "test_group";
+        let member1 = user_pk("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+        let member2 = user_pk("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
+
+        // Setup: Add member1 and member2
+        let initial_member_event = create_nip29_event(
+            GROUP_MEMBERSHIP_KIND,
+            group_id,
+            &[member1, member2],
+            &relay_keys,
+        );
+        super::update_cache_entry(&initial_member_event, &mut cache, &relay_pubkey).await;
+        assert_eq!(
+            cache.get_role(group_id, &member1.to_hex()),
+            Some(GroupRole::Member)
+        );
+        assert_eq!(
+            cache.get_role(group_id, &member2.to_hex()),
+            Some(GroupRole::Member)
+        );
+
+        // Action: Send member event without member1
+        let remove_member1_event =
+            create_nip29_event(GROUP_MEMBERSHIP_KIND, group_id, &[member2], &relay_keys);
+        super::update_cache_entry(&remove_member1_event, &mut cache, &relay_pubkey).await;
+
+        // Assertion: member1 should be gone, member2 remains
+        assert_eq!(cache.get_role(group_id, &member1.to_hex()), None);
+        assert_eq!(
+            cache.get_role(group_id, &member2.to_hex()),
+            Some(GroupRole::Member)
+        );
+        assert_eq!(cache.cache.get(group_id).map(|g| g.len()), Some(1)); // Only member2 remains
+    }
+
+    #[tokio::test]
+    async fn test_add_new_member() {
+        let relay_keys = relay_keys();
+        let relay_pubkey = relay_keys.public_key();
+        let mut cache = GroupStateCache::new();
+        let group_id = "test_group";
+        let member1 = user_pk("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+
+        // Action: Send member event with a new member
+        let add_member_event =
+            create_nip29_event(GROUP_MEMBERSHIP_KIND, group_id, &[member1], &relay_keys);
+        super::update_cache_entry(&add_member_event, &mut cache, &relay_pubkey).await;
+
+        // Assertion: member1 should be added as Member
+        assert_eq!(
+            cache.get_role(group_id, &member1.to_hex()),
+            Some(GroupRole::Member)
+        );
+        assert_eq!(cache.cache.get(group_id).map(|g| g.len()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_ignore_event_wrong_author() {
+        let relay_keys = relay_keys();
+        let wrong_keys = Keys::generate(); // Different keys
+        let relay_pubkey = relay_keys.public_key();
+        let mut cache = GroupStateCache::new();
+        let group_id = "test_group";
+        let member1 = user_pk("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+
+        // Action: Create event with wrong keys
+        let event = create_nip29_event(
+            GROUP_MEMBERSHIP_KIND,
+            group_id,
+            &[member1],
+            &wrong_keys, // Signed by wrong key
+        );
+        super::update_cache_entry(&event, &mut cache, &relay_pubkey).await;
+
+        // Assertion: Cache should be empty
+        assert!(cache.cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ignore_event_missing_d_tag() {
+        let relay_keys = relay_keys();
+        let relay_pubkey = relay_keys.public_key();
+        let mut cache = GroupStateCache::new();
+        let member1 = user_pk("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+
+        // Action: Create event without d tag
+        let p_tag = Tag::public_key(member1);
+        let event = EventBuilder::new(GROUP_MEMBERSHIP_KIND, "")
+            .tags(vec![p_tag]) // Only p_tag
+            .sign_with_keys(&relay_keys)
+            .unwrap();
+
+        super::update_cache_entry(&event, &mut cache, &relay_pubkey).await;
+
+        // Assertion: Cache should be empty
+        assert!(cache.cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ignore_event_missing_p_tags() {
+        let relay_keys = relay_keys();
+        let relay_pubkey = relay_keys.public_key();
+        let mut cache = GroupStateCache::new();
+        let group_id = "test_group";
+
+        // Action: Create event without p tags
+        let d_tag = Tag::identifier(group_id.to_string());
+        let event = EventBuilder::new(GROUP_MEMBERSHIP_KIND, "")
+            .tags(vec![d_tag]) // Only d_tag
+            .sign_with_keys(&relay_keys)
+            .unwrap();
+
+        super::update_cache_entry(&event, &mut cache, &relay_pubkey).await;
+
+        // Assertion: Cache should be empty
+        assert!(cache.cache.is_empty());
+    }
 }
