@@ -1,0 +1,8 @@
+{
+  "docs": [
+    {
+      "name": "project_docs",
+      "path": "docs/**/*.md"
+    }
+  ]
+}
