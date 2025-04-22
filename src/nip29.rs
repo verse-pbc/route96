@@ -38,10 +38,21 @@ impl GroupStateCache {
     }
 
     fn update_role(&mut self, group_id: &str, pubkey_hex: &str, role: GroupRole) {
-        self.cache
-            .entry(group_id.to_string())
-            .or_default()
-            .insert(pubkey_hex.to_string(), role);
+        let group = self.cache.entry(group_id.to_string()).or_default();
+
+        match group.entry(pubkey_hex.to_string()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                // Only update the role if the new role is Admin (i.e., upgrade Member to Admin).
+                // Do not downgrade an existing Admin to Member.
+                if role == GroupRole::Admin {
+                    entry.insert(role);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                // If the pubkey wasn't in the group map yet, insert the new role.
+                entry.insert(role);
+            }
+        }
     }
 
     fn get_role(&self, group_id: &str, pubkey_hex: &str) -> Option<GroupRole> {
@@ -90,7 +101,7 @@ fn process_event_tags(event: &Event) -> Option<(String, HashSet<PublicKey>)> {
         .collect::<HashSet<PublicKey>>();
 
     if members.is_empty() {
-        None // Need at least one member tag
+        None // NIP-29 requires at least one 'p' tag for a valid group definition
     } else {
         Some((group_id, members))
     }
@@ -108,23 +119,82 @@ async fn update_cache_entry(event: &Event, cache: &mut GroupStateCache, relay_pu
         return;
     }
 
-    if let Some((group_id, members)) = process_event_tags(event) {
-        let role = match event.kind {
-            kind if kind == GROUP_ADMINS_KIND => GroupRole::Admin,
-            kind if kind == GROUP_MEMBERSHIP_KIND => GroupRole::Member,
-            _ => return, // Ignore other kinds
-        };
-
-        // Add a minimal log message for the update
+    if let Some((group_id, event_members)) = process_event_tags(event) {
         debug!(
-            "NIP-29 Cache updated: Group='{}' via event {}",
-            group_id, event.id
+            "Processing NIP-29 event: Group='{}', Kind={}, EventId={}",
+            group_id, event.kind, event.id
         );
 
-        // Apply the update to the cache
-        for member_pk in members {
-            // Still need to iterate over the original HashSet
-            cache.update_role(&group_id, &member_pk.to_hex(), role);
+        let group = cache.cache.entry(group_id.clone()).or_default();
+        let event_members_hex: HashSet<String> =
+            event_members.iter().map(|pk| pk.to_hex()).collect();
+
+        match event.kind {
+            kind if kind == GROUP_ADMINS_KIND => {
+                // Replace the admin list for this group
+                let mut current_admins_to_remove = Vec::new();
+                // Find existing admins not in the new event
+                for (pk_hex, role) in group.iter() {
+                    if *role == GroupRole::Admin && !event_members_hex.contains(pk_hex) {
+                        current_admins_to_remove.push(pk_hex.clone());
+                    }
+                }
+                // Remove old admins
+                for pk_hex in current_admins_to_remove {
+                    debug!("Removing admin {} from group {}", pk_hex, group_id);
+                    group.remove(&pk_hex);
+                }
+                // Add/update admins from the event
+                for pk_hex in event_members_hex {
+                    debug!("Setting {} as admin for group {}", pk_hex, group_id);
+                    group.insert(pk_hex, GroupRole::Admin); // Overwrites if exists (e.g., was Member)
+                }
+            }
+            kind if kind == GROUP_MEMBERSHIP_KIND => {
+                // Kind 39002 lists *all* members (including admins).
+                // It defines the complete set of pubkeys that should be in the group.
+                // Remove anyone currently in the cache who isn't in this event.
+                // Add anyone in this event who isn't already in the cache (as Member),
+                // preserving existing Admins.
+
+                let current_group_keys: HashSet<String> = group.keys().cloned().collect();
+                let keys_in_event: &HashSet<String> = &event_members_hex; // Alias for clarity
+
+                // Find users to remove (present in cache, absent in event)
+                let keys_to_remove = current_group_keys.difference(keys_in_event);
+
+                for pk_hex in keys_to_remove {
+                    debug!(
+                        "Removing user {} from group {} (no longer in Kind 39002 event {}",
+                        pk_hex,
+                        group_id,
+                        event.id.to_hex()
+                    );
+                    group.remove(pk_hex);
+                }
+
+                // Find users to add/ensure exist (present in event)
+                // Use or_insert to avoid overwriting existing Admins with Member role.
+                for pk_hex in keys_in_event {
+                    group.entry(pk_hex.clone()).or_insert_with(|| {
+                        debug!(
+                            "Adding user {} as Member to group {} (from Kind 39002 event {})",
+                            pk_hex,
+                            group_id,
+                            event.id.to_hex()
+                        );
+                        GroupRole::Member // Only inserted if the key was not present
+                    });
+                }
+            }
+            _ => {
+                // Should not happen due to filter, but good practice
+                warn!(
+                    "Received unexpected event kind {} in update_cache_entry for group {}",
+                    event.kind, group_id
+                );
+                return;
+            }
         }
     } else {
         warn!(
@@ -210,8 +280,7 @@ pub async fn init_nip29_client(
                 update_cache_entry(&event, &mut cache_writer, &relay_pubkey).await;
             }
 
-            // Log the cache state directly using the write lock guard
-            // before it's released.
+            // Log the cache state while holding the write lock
             info!(
                 "NIP-29 Cache state after initial load ({} groups):",
                 cache_writer.cache.len()
@@ -235,14 +304,13 @@ pub async fn init_nip29_client(
                     info!("    Members: {}", regular_members.join(", "));
                 }
             }
-            // Write lock (`cache_writer`) is released when it goes out of scope here
         }
         Err(e) => {
             warn!(
                 "Error during paginated fetch of initial NIP-29 events from {}: {}. Cache might be incomplete.",
                 relay_url, e
             );
-            // Note: Continue initialization even if fetch fails, the cache will just be empty/incomplete.
+            // Continue initialization even if fetch fails, cache will be incomplete.
         }
     }
 
@@ -279,7 +347,7 @@ pub async fn init_nip29_client(
         }
         info!("Subscribed to NIP-29 updates on {}.", background_relay_url);
 
-        // Handle notifications (rest of the handler remains the same)
+        // Handle notifications
         if let Err(e) = background_client
             .handle_notifications(|notification| {
                 let cache_clone = background_cache.clone();
@@ -355,7 +423,7 @@ pub async fn fetch_paginated_events_from(
 
     let mut combined_events = Events::new(&initial_filter);
     let mut current_until: Option<Timestamp> = None;
-    let mut last_oldest_event_id: Option<EventId> = None; // Track the ID to detect timestamp collisions
+    let mut last_oldest_event_id: Option<EventId> = None; // Track last oldest ID to detect timestamp collisions
 
     loop {
         // Prepare the filter for the current page request
@@ -381,7 +449,7 @@ pub async fn fetch_paginated_events_from(
                 let num_fetched = fetched_page_events.len();
                 debug!("Fetched {} events for this page.", num_fetched);
 
-                // Find the event with the *minimum* timestamp in the current page
+                // Find the event with the minimum timestamp; relays might not guarantee order.
                 let oldest_event_in_page = fetched_page_events.iter().min_by_key(|e| e.created_at);
 
                 if let Some(oldest_event) = oldest_event_in_page {
@@ -407,14 +475,16 @@ pub async fn fetch_paginated_events_from(
                         size_after_merge - size_before_merge
                     );
 
-                    // Determine the 'until' timestamp for the *next* iteration.
+                    // Determine the 'until' timestamp for the next page request.
                     let next_until_ts = if Some(oldest_id) == last_oldest_event_id {
-                        // We fetched the same oldest event as the last page (timestamp collision).
-                        // Decrement the timestamp slightly to force progress past this exact second.
-                        debug!("Oldest event ID {} matches previous page's oldest; decrementing timestamp from {}.", oldest_id.to_hex(), oldest_ts);
+                        // Timestamp collision: Decrement timestamp by 1s to avoid getting stuck.
+                        debug!(
+                            "Oldest event ID {} matches previous; decrementing timestamp from {}.",
+                            oldest_id.to_hex(),
+                            oldest_ts
+                        );
                         Timestamp::from(oldest_ts.as_u64().saturating_sub(1))
                     } else {
-                        // Use the exact timestamp of the oldest event found in this page.
                         oldest_ts
                     };
 
@@ -424,20 +494,17 @@ pub async fn fetch_paginated_events_from(
                     // Set the timestamp for the next request.
                     current_until = Some(next_until_ts);
 
-                    // Add a small safeguard: If the timestamp isn't decreasing, break.
-                    // This helps prevent infinite loops if the relay behaves unexpectedly.
-                    // Note: We compare against the *next* 'until', not the current oldest_ts.
-                    // Also need to check if the oldest ID actually changed, otherwise decrementing is valid.
+                    // Safeguard against potential infinite loops if timestamp logic fails
                     if let Some(prev_until) = current_until {
-                        // Check only if the oldest ID is different from the last iteration
+                        // Check only if the oldest ID is different from the last iteration.
+                        // If the ID is the same, decrementing the timestamp is expected.
                         if next_until_ts >= prev_until && Some(oldest_id) != last_oldest_event_id {
-                            warn!("Pagination 'until' timestamp did not decrease ({:?} -> {:?}) despite different oldest event ID. Stopping pagination to prevent potential loop.", prev_until, next_until_ts);
+                            warn!("Pagination 'until' timestamp did not decrease ({:?} -> {:?}) despite different oldest event ID. Stopping.", prev_until, next_until_ts);
                             break;
                         }
                     }
                 } else {
-                    // This case should ideally not be reached if fetched_page_events wasn't empty,
-                    // but we handle it defensively.
+                    // Should not happen if fetched_page_events wasn't empty
                     debug!(
                         "Fetched non-empty Events list, but couldn't find oldest event via min_by_key. Stopping."
                     );
@@ -452,7 +519,7 @@ pub async fn fetch_paginated_events_from(
     }
 
     debug!(
-        "Pagination finished. Final combined_events count (after deduplication): {}",
+        "Pagination finished. Total unique events fetched: {}",
         combined_events.len()
     );
     Ok(combined_events)
