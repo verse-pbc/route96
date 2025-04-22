@@ -1,0 +1,10 @@
+# Rocket.toml
+[default]
+# Keep other default settings
+
+[default.log]
+# Set the default log level for the application if not overridden by RUST_LOG
+# level = "normal"
+
+# Silence logs from rocket::server below critical level
+"rocket::server" = "critical"

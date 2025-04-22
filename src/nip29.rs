@@ -115,14 +115,15 @@ async fn update_cache_entry(event: &Event, cache: &mut GroupStateCache, relay_pu
             _ => return, // Ignore other kinds
         };
 
+        // Add a minimal log message for the update
         debug!(
-            "Updating cache for group '{}' with role {:?} for {} members from event {}",
-            group_id,
-            role,
-            members.len(),
-            event.id
+            "NIP-29 Cache updated: Group='{}' via event {}",
+            group_id, event.id
         );
+
+        // Apply the update to the cache
         for member_pk in members {
+            // Still need to iterate over the original HashSet
             cache.update_role(&group_id, &member_pk.to_hex(), role);
         }
     } else {
@@ -173,8 +174,10 @@ pub async fn init_nip29_client(
     keys: Keys,
 ) -> anyhow::Result<(Arc<Nip29Client>, JoinHandle<()>)> {
     let relay_url = settings.nip29_relay.url.clone();
+    let relay_pubkey = keys.public_key();
 
     info!("Initializing NIP-29 client for relay: {}", relay_url);
+    info!("NIP-29 Relay PubKey: {}", relay_pubkey.to_hex());
 
     let opts = Options::default();
     let client = Client::builder().signer(keys.clone()).opts(opts).build();
@@ -185,7 +188,6 @@ pub async fn init_nip29_client(
     client.connect().await;
 
     let cache = Arc::new(RwLock::new(GroupStateCache::new()));
-    let relay_pubkey = keys.public_key();
 
     let initial_filter = Filter::new()
         .author(relay_pubkey)
@@ -207,12 +209,40 @@ pub async fn init_nip29_client(
             for event in events {
                 update_cache_entry(&event, &mut cache_writer, &relay_pubkey).await;
             }
+
+            // Log the cache state directly using the write lock guard
+            // before it's released.
+            info!(
+                "NIP-29 Cache state after initial load ({} groups):",
+                cache_writer.cache.len()
+            );
+            for (group_id, members) in cache_writer.cache.iter() {
+                info!("  Group: {}", group_id);
+                let mut admins = Vec::new();
+                let mut regular_members = Vec::new();
+
+                for (pubkey, role) in members.iter() {
+                    match role {
+                        GroupRole::Admin => admins.push(pubkey.as_str()),
+                        GroupRole::Member => regular_members.push(pubkey.as_str()),
+                    }
+                }
+
+                if !admins.is_empty() {
+                    info!("    Admins: {}", admins.join(", "));
+                }
+                if !regular_members.is_empty() {
+                    info!("    Members: {}", regular_members.join(", "));
+                }
+            }
+            // Write lock (`cache_writer`) is released when it goes out of scope here
         }
         Err(e) => {
             warn!(
                 "Error during paginated fetch of initial NIP-29 events from {}: {}. Cache might be incomplete.",
                 relay_url, e
             );
+            // Note: Continue initialization even if fetch fails, the cache will just be empty/incomplete.
         }
     }
 
@@ -325,7 +355,7 @@ pub async fn fetch_paginated_events_from(
 
     let mut combined_events = Events::new(&initial_filter);
     let mut current_until: Option<Timestamp> = None;
-    let mut last_oldest_event_id: Option<EventId> = None;
+    let mut last_oldest_event_id: Option<EventId> = None; // Track the ID to detect timestamp collisions
 
     loop {
         // Prepare the filter for the current page request
@@ -348,12 +378,11 @@ pub async fn fetch_paginated_events_from(
                     break; // No more events found for this filter range
                 }
 
-                debug!(
-                    "Fetched {} events for this page.",
-                    fetched_page_events.len()
-                );
+                let num_fetched = fetched_page_events.len();
+                debug!("Fetched {} events for this page.", num_fetched);
 
-                let oldest_event_in_page = fetched_page_events.iter().last();
+                // Find the event with the *minimum* timestamp in the current page
+                let oldest_event_in_page = fetched_page_events.iter().min_by_key(|e| e.created_at);
 
                 if let Some(oldest_event) = oldest_event_in_page {
                     let oldest_ts = oldest_event.created_at;
@@ -364,30 +393,53 @@ pub async fn fetch_paginated_events_from(
                         oldest_ts
                     );
 
+                    // Log size before merge for deduplication info
+                    let size_before_merge = combined_events.len();
+
                     // Merge events *before* calculating next 'until'
                     combined_events = combined_events.merge(fetched_page_events);
 
+                    let size_after_merge = combined_events.len();
+                    debug!(
+                        "Combined events size: {} -> {} ({} new unique events added)",
+                        size_before_merge,
+                        size_after_merge,
+                        size_after_merge - size_before_merge
+                    );
+
                     // Determine the 'until' timestamp for the *next* iteration.
-                    let next_until_ts = if last_oldest_event_id == Some(oldest_id) {
-                        // We fetched the same oldest event as the last page,
-                        // indicating timestamp collision or relay behavior requiring
-                        // decrementing the timestamp to force progress.
-                        debug!("Oldest event ID matches previous page, decrementing timestamp.");
+                    let next_until_ts = if Some(oldest_id) == last_oldest_event_id {
+                        // We fetched the same oldest event as the last page (timestamp collision).
+                        // Decrement the timestamp slightly to force progress past this exact second.
+                        debug!("Oldest event ID {} matches previous page's oldest; decrementing timestamp from {}.", oldest_id.to_hex(), oldest_ts);
                         Timestamp::from(oldest_ts.as_u64().saturating_sub(1))
                     } else {
-                        // Use the exact timestamp of the oldest event.
+                        // Use the exact timestamp of the oldest event found in this page.
                         oldest_ts
                     };
 
-                    // Update the oldest ID for the next iteration's check.
+                    // Update the oldest ID tracker for the next iteration's collision check.
                     last_oldest_event_id = Some(oldest_id);
 
                     // Set the timestamp for the next request.
                     current_until = Some(next_until_ts);
+
+                    // Add a small safeguard: If the timestamp isn't decreasing, break.
+                    // This helps prevent infinite loops if the relay behaves unexpectedly.
+                    // Note: We compare against the *next* 'until', not the current oldest_ts.
+                    // Also need to check if the oldest ID actually changed, otherwise decrementing is valid.
+                    if let Some(prev_until) = current_until {
+                        // Check only if the oldest ID is different from the last iteration
+                        if next_until_ts >= prev_until && Some(oldest_id) != last_oldest_event_id {
+                            warn!("Pagination 'until' timestamp did not decrease ({:?} -> {:?}) despite different oldest event ID. Stopping pagination to prevent potential loop.", prev_until, next_until_ts);
+                            break;
+                        }
+                    }
                 } else {
                     // This case should ideally not be reached if fetched_page_events wasn't empty,
+                    // but we handle it defensively.
                     debug!(
-                        "Fetched non-empty Events, but couldn't find oldest event via iterator. Stopping."
+                        "Fetched non-empty Events list, but couldn't find oldest event via min_by_key. Stopping."
                     );
                     break;
                 }
@@ -400,7 +452,7 @@ pub async fn fetch_paginated_events_from(
     }
 
     debug!(
-        "Pagination finished. Total events fetched (after deduplication): {}",
+        "Pagination finished. Final combined_events count (after deduplication): {}",
         combined_events.len()
     );
     Ok(combined_events)
