@@ -31,11 +31,13 @@ spec:
             - name: APP__MAX_UPLOAD_BYTES
               value: "5000000000"
             - name: APP__PUBLIC_URL
-              value: http://localhost:8000
+              value: https://blossom.verse.app
             - name: APP__NIP29_RELAY__URL
               value: wss://communities.nos.social
             - name: APP__NIP29_RELAY__CACHE_EXPIRATION
               value: "300"
+            - name: RUST_LOG
+              value: "route96=debug,rocket::launch=info,rocket::server::health=off,rocket::server=info,rocket=info"
             - name: APP__NIP29_RELAY__PRIVATE_KEY
               valueFrom:
                 secretKeyRef:
