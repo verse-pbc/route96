@@ -39,9 +39,6 @@ RUN mkdir -p ~/.cargo && \
     echo '[net]' >> ~/.cargo/config.toml && \
     echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
 
-# Perform the installation, enabling only necessary features
-# Remove s3-storage and ranges from features
-# Ensure default features (like media-compression) are included
 RUN cargo install --path . --root /app/build
 
 FROM node:bookworm AS ui_builder

@@ -5,7 +5,7 @@
 use anyhow::{Context, Error};
 use clap::Parser;
 use config::Config;
-use log::{error, info};
+use log::{error, info, warn};
 use nostr_sdk::prelude::Keys;
 use rocket::config::Ident;
 use rocket::data::{ByteUnit, Limits};
@@ -42,6 +42,18 @@ async fn main() -> Result<(), Error> {
         );
     }
     pretty_env_logger::init();
+
+    // === Initialize Rustls Crypto Provider ===
+    // Use the ring provider. Ensure your dependencies pull in rustls with the 'ring' feature.
+    if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
+        // It's possible another provider was already installed (e.g., aws-lc-rs by default)
+        // Log a warning but don't necessarily exit, as the required provider might already be active.
+        warn!("Failed to install rustls ring provider as default: {:?}. Another provider might already be installed.", e);
+        // Alternatively, to be stricter, you could error out:
+        // eprintln!("FATAL: Failed to install rustls ring provider: {:?}", e);
+        // std::process::exit(1);
+    }
+    // =======================================
 
     let args: Args = Args::parse();
 
