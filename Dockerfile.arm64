@@ -57,7 +57,6 @@ RUN wget https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz && \
 COPY src src
 COPY migrations migrations
 
-# Build the binary without default features, enabling only s3-storage and ranges
 RUN cargo build --release
 
 FROM --platform=linux/arm64 node:bookworm AS ui_builder

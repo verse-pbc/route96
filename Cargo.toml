@@ -74,3 +74,12 @@ image = { version = "0.25.1", optional = true }
 rgb = { version = "0.8.38", optional = true }
 half = { version = "2.6.0", features = ["serde"], optional = true }
 async-compression = { version = "0.4", features = ["gzip", "tokio", "brotli", "zstd", "deflate"] }
+
+# Add rustls back as a direct dependency
+rustls = "0.23.26"
+
+# Add these two lines for rustls crypto provider
+# rustls-native-certs = "0.7.1"
+# rustls-ring = "0.23.1"
+
+[dev-dependencies]
