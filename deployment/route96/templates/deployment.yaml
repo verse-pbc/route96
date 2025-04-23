@@ -12,6 +12,8 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: blossom
+  strategy:
+    type: Recreate
   template:
     metadata:
       labels:
